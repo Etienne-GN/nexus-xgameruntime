@@ -57,6 +57,9 @@ public:
     char modernGamertag[97]{};
     char modernGamertagSuffix[15]{};
     char uniqueModernGamertag[101]{};
+    /* Signed in from the offline identity cache: no tokens exist, and token
+     * requests report Microsoft as unreachable (User/OfflineIdentity.h). */
+    bool offline{};
     XUser() : XUser( GetUserTransport() ) {}
     explicit XUser( UserTransport &transport ) : transport( transport )
     {
@@ -65,6 +68,9 @@ public:
     HRESULT InitializeNetwork( XUserAddOptions options );
     HRESULT LoadEndpoints( const BYTE *buffer, SIZE_T size );
     void ResetNetworkState() noexcept;
+    void RememberOfflineIdentity( const BYTE *defaults, SIZE_T defaultsSize, const BYTE *current,
+                                  SIZE_T currentSize ) noexcept;
+    HRESULT SignInOffline( HRESULT failure ) noexcept;
     HRESULT CachePrivileges( const WCHAR *xid, UINT32 xidSize, const WCHAR *privileges, UINT32 privilegesSize );
     HRESULT CheckPrivilege( XUserPrivilege privilege, BOOLEAN *granted, XUserPrivilegeDenyReason *reason );
     BOOLEAN IsStoreUser();

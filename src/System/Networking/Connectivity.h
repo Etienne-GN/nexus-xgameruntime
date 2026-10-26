@@ -69,6 +69,14 @@ inline HRESULT MapConnectivity( const IP_ADAPTER_ADDRESSES *adapters, XNetworkin
     return S_OK;
 }
 
+// A session signed in from the cached offline identity has no internet as far
+// as titles are concerned, whatever the adapters report.
+inline void CapForOfflineIdentity( XNetworkingConnectivityHint *hint, bool offlineIdentity ) noexcept
+{
+    if ( hint && offlineIdentity && hint->connectivityLevel == XNetworkingConnectivityLevelHint::InternetAccess )
+        hint->connectivityLevel = XNetworkingConnectivityLevelHint::LocalAccess;
+}
+
 inline HRESULT ReadConnectivity( XNetworkingConnectivityHint *hint ) noexcept
 {
     if ( !hint ) return E_POINTER;

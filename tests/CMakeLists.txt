@@ -5,6 +5,7 @@ add_executable(test_xgameruntime
         Nexus/test_com_ownership.cpp
         Nexus/test_optional_providers.cpp
         Nexus/test_connectivity.cpp
+        Nexus/test_offline_identity.cpp
         Nexus/test_shutdown.cpp
         Nexus/test_package_layout.cpp
         Nexus/test_async_results.cpp

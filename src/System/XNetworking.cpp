@@ -21,6 +21,7 @@
 
 #include "XNetworking.h"
 #include "Networking/Connectivity.h"
+#include "User/OfflineIdentity.h"
 #include "../Runtime/Configuration.h"
 #include "winhttp.h"
 #include "wincrypt.h"
@@ -357,7 +358,9 @@ done:
 
 HRESULT WINAPI XNetworkingImpl::XNetworkingGetConnectivityHint( XNetworkingConnectivityHint *connectivityHint )
 {
-    return nexus::networking::ReadConnectivity(connectivityHint);
+    HRESULT hr = nexus::networking::ReadConnectivity( connectivityHint );
+    if ( SUCCEEDED( hr ) ) nexus::networking::CapForOfflineIdentity( connectivityHint, nexus::user::offlineIdentityInUse );
+    return hr;
 }
 
 struct connectivity_registration
