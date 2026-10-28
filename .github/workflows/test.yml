@@ -42,7 +42,7 @@ jobs:
           done
           echo /usr/lib/wine >> "$GITHUB_PATH"
       - name: Check ABI and account-free CI policy
-        run: node --test scripts/test-policy.test.mjs scripts/test-builtin.test.mjs
+        run: node --test scripts/test-policy.test.mjs scripts/test-builtin.test.mjs scripts/test-store-context.test.mjs
       - name: Compile C++ component and synthetic tests only
         run: |
           # GCC 13 MinGW static libstdc++ has PR110572 in unoptimized C++23 RTTI.

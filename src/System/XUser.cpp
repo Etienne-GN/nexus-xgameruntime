@@ -21,6 +21,7 @@
 
 #include "User/XUserImpl.h"
 #include "User/Presence.h"
+#include "User/OfflineIdentity.h"
 #include "../Runtime/Configuration.h"
 #include <afunix.h>
 #include <libxml/parser.h>
@@ -937,12 +938,14 @@ HRESULT XUser::InitializeNetwork( XUserAddOptions options )
     char *deviceTicket = NULL, *deviceToken = NULL, *userTicket = NULL;
     struct XUser *impl = user;
     WCHAR *auth = NULL;
-    SIZE_T size;
+    SIZE_T size, defaultSize = 0;
     HRESULT hr;
 
+    /* The launcher already found Microsoft unreachable; fail as the network would. */
+    if ( nexus::user::ForcedOffline() ) return HRESULT_FROM_WIN32( ERROR_WINHTTP_CANNOT_CONNECT );
     auth_metadata( "init-default-begin", user, E_PENDING, 0, FALSE, FALSE );
     hr = user->transport.Http( L"GET", L"https://title.mgt.xboxlive.com/titles/default/endpoints?type=1", NULL, NULL,
-                               ACCEPT_JSON, &defaultBuffer, &size );
+                               ACCEPT_JSON, &defaultBuffer, &defaultSize );
     auth_metadata( "init-default-end", user, hr, 0, FALSE, FALSE );
     if ( FAILED( hr ) ) return hr;
     if ( cancelled )
@@ -950,7 +953,7 @@ HRESULT XUser::InitializeNetwork( XUserAddOptions options )
         hr = E_ABORT;
         goto cleanup;
     }
-    hr = impl->LoadEndpoints( defaultBuffer, size );
+    hr = impl->LoadEndpoints( defaultBuffer, defaultSize );
     auth_metadata( "init-default-parse", user, hr, 0, FALSE, FALSE );
     if ( FAILED( hr ) ) goto cleanup;
     if ( cancelled )
@@ -1010,6 +1013,7 @@ HRESULT XUser::InitializeNetwork( XUserAddOptions options )
         hr = E_ABORT;
         goto cleanup;
     }
+    impl->RememberOfflineIdentity( defaultBuffer, defaultSize, currentBuffer, size );
 
 cleanup:
     if ( currentBuffer ) free( currentBuffer );
@@ -1034,6 +1038,7 @@ void XUser::ResetNetworkState() noexcept
     free( deviceAuthAudience );
     deviceAuthAudience = nullptr;
     deviceAuthTime = 0;
+    offline = false;
     privilegesKnown = FALSE;
     privilegesCheckedAt = 0;
     memset( grantedPrivileges, 0, sizeof( grantedPrivileges ) );
@@ -1055,6 +1060,72 @@ void XUser::ResetNetworkState() noexcept
     free( policies );
     policies = nullptr;
     policiesLen = 0;
+}
+
+/* After a complete network sign-in: keep the identity only when the backend
+ * says Microsoft issued this device an offline lease on this launch; remove
+ * it when offline play is not (or no longer) granted. */
+void XUser::RememberOfflineIdentity( const BYTE *defaults, SIZE_T defaultsSize, const BYTE *current,
+                                     SIZE_T currentSize ) noexcept
+{
+    try
+    {
+        const auto mode = nexus::user::ReadOfflineIdentityMode();
+        const auto store = nexus::user::OfflineIdentityStore::ForAccount();
+        if ( !store || mode == nexus::user::OfflineIdentityMode::Use ) return;
+        if ( mode == nexus::user::OfflineIdentityMode::None )
+        {
+            store->Remove();
+            return;
+        }
+        nexus::user::OfflineIdentity identity{ xuid, static_cast<unsigned>( age_group ), nexus::user::FileTimeNow(),
+                                               gamertag, modernGamertag, modernGamertagSuffix, uniqueModernGamertag };
+        if ( !store->Save( identity, std::string_view( reinterpret_cast<const char *>( defaults ), defaultsSize ),
+                           std::string_view( reinterpret_cast<const char *>( current ), currentSize ) ) )
+            WARN( "offline identity not stored.\n" );
+    }
+    catch ( ... )
+    {
+        WARN( "offline identity not stored.\n" );
+    }
+}
+
+/* Microsoft unreachable on a launch the backend runs on a validated offline
+ * license: complete the sign-in from the cached identity. Every other failure
+ * stands. */
+HRESULT XUser::SignInOffline( HRESULT failure ) noexcept
+{
+    if ( !nexus::user::IsConnectivityFailure( failure ) ||
+         nexus::user::ReadOfflineIdentityMode() != nexus::user::OfflineIdentityMode::Use )
+        return failure;
+    try
+    {
+        const auto store = nexus::user::OfflineIdentityStore::ForAccount();
+        nexus::user::OfflineIdentity identity;
+        std::string defaults, current;
+        if ( !store || !store->Load( nexus::user::FileTimeNow(), identity, defaults, current ) ) return failure;
+        ResetNetworkState();
+        if ( FAILED( LoadEndpoints( reinterpret_cast<const BYTE *>( defaults.data() ), defaults.size() ) ) ||
+             FAILED( LoadEndpoints( reinterpret_cast<const BYTE *>( current.data() ), current.size() ) ) )
+        {
+            ResetNetworkState();
+            return failure;
+        }
+        xuid = identity.xuid;
+        age_group = static_cast<XUserAgeGroup>( identity.ageGroup );
+        lstrcpynA( gamertag, identity.gamertag.c_str(), sizeof( gamertag ) );
+        lstrcpynA( modernGamertag, identity.modernGamertag.c_str(), sizeof( modernGamertag ) );
+        lstrcpynA( modernGamertagSuffix, identity.modernGamertagSuffix.c_str(), sizeof( modernGamertagSuffix ) );
+        lstrcpynA( uniqueModernGamertag, identity.uniqueModernGamertag.c_str(), sizeof( uniqueModernGamertag ) );
+        offline = true;
+        WARN( "Microsoft is unreachable (hr %#lx); continuing with the cached offline identity.\n", failure );
+        return S_OK;
+    }
+    catch ( ... )
+    {
+        ResetNetworkState();
+        return failure;
+    }
 }
 
 static void set_signed_in_user( struct XUser *user );
@@ -1173,6 +1244,11 @@ static DWORD WINAPI UserNetworkInitThread( void *arg )
         hr = user->InitializeNetwork( context->options );
         auth_metadata( "init-attempt-end", user, hr, 0, FALSE, FALSE );
         if ( SUCCEEDED( hr ) || user->cancelled ) break;
+        /* An unreachable Microsoft on an offline-licensed launch is not a
+         * start race: the cached identity takes over without the retry waits. */
+        if ( nexus::user::IsConnectivityFailure( hr ) &&
+             nexus::user::ReadOfflineIdentityMode() == nexus::user::OfflineIdentityMode::Use )
+            break;
         if ( attempt < 4 )
         {
             auth_metadata( "init-retry", user, hr, 0, FALSE, FALSE );
@@ -1181,6 +1257,7 @@ static DWORD WINAPI UserNetworkInitThread( void *arg )
         }
     }
     if ( user->cancelled ) hr = E_ABORT;
+    else if ( FAILED( hr ) && SUCCEEDED( com ) ) hr = user->SignInOffline( hr );
     if ( SUCCEEDED( com ) ) CoUninitialize();
     context->Complete( threading, hr );
     user->Release();
@@ -1440,6 +1517,7 @@ static void set_signed_in_user( struct XUser *user )
     ( user )->AddRef();
     if ( signed_in_user ) ( signed_in_user )->Release();
     signed_in_user = user;
+    nexus::user::offlineIdentityInUse = user->offline;
     ReleaseSRWLockExclusive( &signed_in_section );
 }
 
@@ -2995,6 +3073,9 @@ static HRESULT xsts_authorize_privilege( XUserHandle user, const char *relyingPa
 
     auth_metadata( "xsts-begin", user, E_PENDING, 0, requested_title, FALSE );
     if ( granted ) *granted = FALSE;
+    /* A cached offline identity has no tokens; report what an online attempt
+     * would produce. */
+    if ( user->offline ) return HRESULT_FROM_WIN32( ERROR_WINHTTP_CANNOT_CONNECT );
     if ( presence && ( !title || !user->titleToken || !*user->titleToken || !user->xuid ) ) return E_GAMEUSER_NO_AUTH_USER;
 
     if ( !user->deviceToken || !user->userToken || !user->proofKey )
