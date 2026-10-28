@@ -1,5 +1,18 @@
 configure_file(Nexus/MicrosoftGame.config "${CMAKE_BINARY_DIR}/bin/MicrosoftGame.config" COPYONLY)
 
+add_executable(nexus_store-context Nexus/store-context.cpp)
+add_dependencies(nexus_store-context xgameruntime-idl)
+target_include_directories(nexus_store-context PRIVATE "${IDL_BINARY_DIR}" "${PROJECT_SOURCE_DIR}/include")
+target_link_libraries(nexus_store-context PRIVATE xgameruntime-common runtimeobject ole32)
+target_compile_features(nexus_store-context PRIVATE cxx_std_23)
+target_link_options(nexus_store-context PRIVATE -static -static-libgcc -static-libstdc++)
+set_target_properties(nexus_store-context PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+add_executable(nexus_store-context-raw Nexus/store-context-raw.cpp)
+target_link_libraries(nexus_store-context-raw PRIVATE runtimeobject ole32)
+target_compile_features(nexus_store-context-raw PRIVATE cxx_std_23)
+target_link_options(nexus_store-context-raw PRIVATE -static -static-libgcc -static-libstdc++)
+set_target_properties(nexus_store-context-raw PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+
 add_executable(test_xgameruntime
         Nexus/test_system.cpp
         Nexus/test_com_ownership.cpp

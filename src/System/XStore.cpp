@@ -32,6 +32,7 @@ static const char *GetStoreProductId();
 #include "Store/PackageLicense.h"
 #include "Store/AddonLicense.h"
 #include "Store/StoreContext.h"
+#include "Store/StoreContextLicense.h"
 
 HRESULT WINAPI XStoreImpl::XStoreCreateContext( const XUserHandle user, XStoreContextHandle *storeContextHandle )
 {
@@ -93,7 +94,7 @@ HRESULT WINAPI XStoreImpl::XStoreQueryEntitledProductsResult( XAsyncBlock *async
 HRESULT WINAPI XStoreImpl::XStoreQueryProductForCurrentGameAsync( const XStoreContextHandle storeContextHandle,
                                                                   XAsyncBlock *async )
 {
-    HRESULT hr = entitled_begin( storeContextHandle, static_cast<UINT32>( XStoreProductKind::Game ), 1, async );
+    HRESULT hr = entitled_begin( storeContextHandle, static_cast<UINT32>( XStoreProductKind::Game ), 1, async, FALSE, TRUE );
     NEXUS_STORE_META( 31, hr, 0, NULL );
     return hr;
 }

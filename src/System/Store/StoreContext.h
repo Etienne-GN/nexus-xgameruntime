@@ -24,10 +24,13 @@ static const GUID IID_IStoreAppLicense = { 0xf389f9de, 0x73c0, 0x45ce, { 0x9b, 0
 /* IAsyncOperation<StoreAppLicense> (parameterized interface ID) */
 static const GUID IID_IAsyncOperation_StoreAppLicense = { 0x3866370b, 0xafc6, 0x5d01, { 0x84, 0xc2, 0x45, 0x74, 0x62, 0x8d, 0xe5, 0x39 } };
 
-enum : int { STATUS_STARTED = 0, STATUS_COMPLETED = 1 };
+enum : int { STATUS_STARTED = 0, STATUS_COMPLETED = 1, STATUS_CANCELED = 2, STATUS_ERROR = 3 };
 
 static const HRESULT E_ILLEGAL_METHOD_CALL_ = static_cast<HRESULT>( 0x8000000E );
 static const HRESULT E_ILLEGAL_DELEGATE_ASSIGNMENT_ = static_cast<HRESULT>( 0x80000018 );
+#ifndef RO_E_CLOSED
+#define RO_E_CLOSED _HRESULT_TYPEDEF_(0x80000013)
+#endif
 
 /* Interface layouts, in Windows metadata order. */
 
@@ -106,79 +109,16 @@ struct IStoreContextStatics_ : IInspectable
 
 /* ---- the verified license ---- */
 
-/* Licenses are verified online; reuse a verified answer briefly, and keep it
- * through a failed refresh only while Microsoft's own expiry still allows. */
-static const ULONGLONG LICENSE_REUSE_MS = 10 * 60 * 1000;
-static SRWLOCK license_lock = SRWLOCK_INIT;
-static XStoreGameLicense license_cached;
-static ULONGLONG license_cached_at;
-static BOOL license_cached_valid;
-
-static HRESULT query_game_license( XStoreGameLicense *out )
-{
-    XStoreContextHandle store = nullptr;
-    XTaskQueueHandle queue = nullptr;
-    IXThreadingImpl *threading = nullptr;
-    XAsyncBlock block = {};
-    HRESULT hr;
-    int i;
-
-    *out = {};
-    /* The title publishes its game configuration when it initializes the runtime. */
-    for ( i = 0; i < 300 && !nexus::GetGameConfiguration(); i++ ) Sleep( 100 );
-    if ( !GetStoreProductId() ) return E_GAME_MISSING_GAME_CONFIG;
-
-    if ( FAILED( hr = entitled_store_create( nullptr, &store ) ) ) return hr;
-    if ( SUCCEEDED( hr = QueryApiImpl( CLSID_XThreadingImpl, IID_IXThreadingImpl, ( void ** )&threading ) ) &&
-         SUCCEEDED( hr = threading->XTaskQueueCreate( XTaskQueueDispatchMode::ThreadPool,
-                                                      XTaskQueueDispatchMode::ThreadPool, &queue ) ) )
-    {
-        block.queue = queue;
-        hr = entitled_begin( store, static_cast<UINT32>( XStoreProductKind::Game ), ENTITLED_MAX_PRODUCTS, &block,
-                             TRUE );
-        if ( SUCCEEDED( hr ) ) hr = threading->XAsyncGetStatus( &block, TRUE );
-        if ( SUCCEEDED( hr ) ) hr = threading->XAsyncGetResult( &block, &entitled_game_identity, sizeof( *out ), out, nullptr );
-        threading->XTaskQueueCloseHandle( queue );
-    }
-    if ( threading ) threading->Release();
-    entitled_store_close( store );
-    if ( SUCCEEDED( hr ) && !out->isActive ) hr = E_ACCESSDENIED;
-    return hr;
-}
-
-static void current_game_license( XStoreGameLicense *out )
-{
-    const ULONGLONG now = GetTickCount64();
-    XStoreGameLicense fresh;
-
-    AcquireSRWLockShared( &license_lock );
-    const BOOL reuse = license_cached_valid && now - license_cached_at < LICENSE_REUSE_MS &&
-                       license_cached.expirationDate > time( nullptr );
-    if ( reuse ) *out = license_cached;
-    ReleaseSRWLockShared( &license_lock );
-    if ( reuse ) return;
-
-    const HRESULT hr = query_game_license( &fresh );
-    AcquireSRWLockExclusive( &license_lock );
-    if ( SUCCEEDED( hr ) )
-    {
-        license_cached = fresh;
-        license_cached_at = GetTickCount64();
-        license_cached_valid = TRUE;
-        *out = fresh;
-    }
-    else if ( license_cached_valid && license_cached.expirationDate > time( nullptr ) )
-        *out = license_cached;
-    else
-        *out = {}; /* not proven: inactive */
-    ReleaseSRWLockExclusive( &license_lock );
-}
+/* Use the existing verified receipt path for every operation. A denial or an
+ * account change must never fall back to a previously successful license. */
+static HRESULT query_game_license( XStoreGameLicense *out, const std::atomic<bool> &canceled );
 
 static HRESULT make_hstring( const char *text, HSTRING *out )
 {
     WCHAR wide[128];
     int length;
 
+    if ( !out ) return E_POINTER;
     *out = nullptr;
     if ( !text || !*text ) return S_OK;
     if ( !( length = MultiByteToWideChar( CP_UTF8, 0, text, -1, wide, ARRAY_SIZE( wide ) ) ) ) return E_FAIL;
@@ -190,12 +130,14 @@ static HRESULT make_hstring( const char *text, HSTRING *out )
 #define INSPECTABLE_STUBS                                                                                            \
     HRESULT STDMETHODCALLTYPE GetIids( ULONG *count, IID **iids ) override                                           \
     {                                                                                                                \
+        if ( !count || !iids ) return E_POINTER;                                                                      \
         *count = 0;                                                                                                  \
         *iids = nullptr;                                                                                             \
         return S_OK;                                                                                                 \
     }                                                                                                                \
     HRESULT STDMETHODCALLTYPE GetTrustLevel( TrustLevel *level ) override                                            \
     {                                                                                                                \
+        if ( !level ) return E_POINTER;                                                                               \
         *level = BaseTrust;                                                                                          \
         return S_OK;                                                                                                 \
     }
@@ -210,6 +152,7 @@ public:
 
     HRESULT STDMETHODCALLTYPE QueryInterface( REFIID iid, void **out ) override
     {
+        if ( !out ) return E_POINTER;
         if ( IsEqualGUID( iid, IID_IUnknown ) || IsEqualGUID( iid, IID_IInspectable ) ||
              IsEqualGUID( iid, IID_IAgileObject_ ) || IsEqualGUID( iid, IID_IStoreAppLicense ) )
         {
@@ -236,37 +179,44 @@ public:
     HRESULT STDMETHODCALLTYPE get_SkuStoreId( HSTRING *value ) override { return make_hstring( license.skuStoreId, value ); }
     HRESULT STDMETHODCALLTYPE get_IsActive( boolean *value ) override
     {
-        *value = license.isActive ? TRUE : FALSE;
+        if ( !value ) return E_POINTER;
+        *value = license.isActive && license.expirationDate > time( nullptr ) ? TRUE : FALSE;
         return S_OK;
     }
     HRESULT STDMETHODCALLTYPE get_IsTrial( boolean *value ) override
     {
+        if ( !value ) return E_POINTER;
         *value = license.isTrial ? TRUE : FALSE;
         return S_OK;
     }
     HRESULT STDMETHODCALLTYPE get_ExpirationDate( INT64 *value ) override
     {
+        if ( !value ) return E_POINTER;
         /* DateTime: 100 ns units since 1601-01-01 */
         *value = license.expirationDate > 0 ? ( static_cast<INT64>( license.expirationDate ) + 11644473600LL ) * 10000000LL : 0;
         return S_OK;
     }
     HRESULT STDMETHODCALLTYPE get_ExtendedJsonData( HSTRING *value ) override
     {
+        if ( !value ) return E_POINTER;
         *value = nullptr;
         return S_OK;
     }
     HRESULT STDMETHODCALLTYPE get_AddOnLicenses( IInspectable **value ) override
     {
+        if ( !value ) return E_POINTER;
         *value = nullptr;
         return E_NOTIMPL;
     }
     HRESULT STDMETHODCALLTYPE get_TrialTimeRemaining( INT64 *value ) override
     {
+        if ( !value ) return E_POINTER;
         *value = static_cast<INT64>( license.trialTimeRemainingInSeconds ) * 10000000LL;
         return S_OK;
     }
     HRESULT STDMETHODCALLTYPE get_IsTrialOwnedByThisUser( boolean *value ) override
     {
+        if ( !value ) return E_POINTER;
         *value = license.isTrialOwnedByThisUser ? TRUE : FALSE;
         return S_OK;
     }
@@ -279,6 +229,9 @@ class AppLicenseOperation final : public IAsyncOperation_StoreAppLicense, public
     SRWLOCK lock = SRWLOCK_INIT;
     int status = STATUS_STARTED;
     BOOL handler_set = FALSE;
+    bool closed = false;
+    std::atomic<bool> canceled{ false };
+    HRESULT error = S_OK;
     ICompletedHandler_ *handler = nullptr;
     AppLicense *result = nullptr;
 
@@ -288,17 +241,27 @@ class AppLicenseOperation final : public IAsyncOperation_StoreAppLicense, public
         XStoreGameLicense license;
         ICompletedHandler_ *notify;
 
-        current_game_license( &license );
+        HRESULT hr = query_game_license( &license, operation->canceled );
+        if ( FAILED( hr ) ) license = {};
         AppLicense *value = new ( std::nothrow ) AppLicense( license );
         AcquireSRWLockExclusive( &operation->lock );
+        if ( operation->status != STATUS_STARTED )
+        {
+            ReleaseSRWLockExclusive( &operation->lock );
+            if ( value ) value->Release();
+            operation->Release();
+            return 0;
+        }
         operation->result = value;
-        operation->status = STATUS_COMPLETED;
+        operation->error = value ? S_OK : E_OUTOFMEMORY;
+        operation->status = value ? STATUS_COMPLETED : STATUS_ERROR;
+        const int terminal = operation->status;
         notify = operation->handler;
-        operation->handler = nullptr;
+        if ( notify ) notify->AddRef();
         ReleaseSRWLockExclusive( &operation->lock );
         if ( notify )
         {
-            notify->Invoke( operation, STATUS_COMPLETED );
+            notify->Invoke( operation, terminal );
             notify->Release();
         }
         operation->Release(); /* worker reference */
@@ -327,6 +290,7 @@ public:
 
     HRESULT STDMETHODCALLTYPE QueryInterface( REFIID iid, void **out ) override
     {
+        if ( !out ) return E_POINTER;
         if ( IsEqualGUID( iid, IID_IUnknown ) || IsEqualGUID( iid, IID_IInspectable ) ||
              IsEqualGUID( iid, IID_IAgileObject_ ) || IsEqualGUID( iid, IID_IAsyncOperation_StoreAppLicense ) )
             *out = static_cast<IAsyncOperation_StoreAppLicense *>( this );
@@ -350,6 +314,7 @@ public:
     INSPECTABLE_STUBS
     HRESULT STDMETHODCALLTYPE GetRuntimeClassName( HSTRING *name ) override
     {
+        if ( !name ) return E_POINTER;
         *name = nullptr;
         return E_NOTIMPL;
     }
@@ -357,28 +322,33 @@ public:
     /* IAsyncOperation<StoreAppLicense> */
     HRESULT STDMETHODCALLTYPE put_Completed( ICompletedHandler_ *value ) override
     {
-        BOOL completed;
+        int terminal;
         AcquireSRWLockExclusive( &lock );
+        if ( closed ) { ReleaseSRWLockExclusive( &lock ); return RO_E_CLOSED; }
         if ( handler_set )
         {
             ReleaseSRWLockExclusive( &lock );
             return E_ILLEGAL_DELEGATE_ASSIGNMENT_;
         }
         handler_set = TRUE;
-        completed = status == STATUS_COMPLETED;
+        terminal = status;
         if ( value ) value->AddRef();
-        if ( !completed ) handler = value;
+        handler = value;
+        if ( terminal != STATUS_STARTED && value ) value->AddRef();
         ReleaseSRWLockExclusive( &lock );
-        if ( completed && value )
+        if ( terminal != STATUS_STARTED && value )
         {
-            value->Invoke( this, STATUS_COMPLETED );
+            value->Invoke( this, terminal );
             value->Release();
         }
         return S_OK;
     }
     HRESULT STDMETHODCALLTYPE get_Completed( ICompletedHandler_ **value ) override
     {
+        if ( !value ) return E_POINTER;
+        *value = nullptr;
         AcquireSRWLockShared( &lock );
+        if ( closed ) { ReleaseSRWLockShared( &lock ); return RO_E_CLOSED; }
         *value = handler;
         if ( handler ) handler->AddRef();
         ReleaseSRWLockShared( &lock );
@@ -386,9 +356,14 @@ public:
     }
     HRESULT STDMETHODCALLTYPE GetResults( IStoreAppLicense_ **value ) override
     {
+        if ( !value ) return E_POINTER;
+        *value = nullptr;
         HRESULT hr = S_OK;
         AcquireSRWLockShared( &lock );
-        if ( status != STATUS_COMPLETED )
+        if ( closed ) hr = RO_E_CLOSED;
+        else if ( status == STATUS_CANCELED ) hr = E_ABORT;
+        else if ( status == STATUS_ERROR ) hr = error;
+        else if ( status != STATUS_COMPLETED )
             hr = E_ILLEGAL_METHOD_CALL_;
         else if ( !result )
             hr = E_OUTOFMEMORY;
@@ -404,32 +379,61 @@ public:
     /* IAsyncInfo */
     HRESULT STDMETHODCALLTYPE get_Id( UINT32 *id ) override
     {
+        if ( !id ) return E_POINTER;
         *id = 1;
         return S_OK;
     }
     HRESULT STDMETHODCALLTYPE get_Status( int *value ) override
     {
+        if ( !value ) return E_POINTER;
         AcquireSRWLockShared( &lock );
+        if ( closed ) { ReleaseSRWLockShared( &lock ); return RO_E_CLOSED; }
         *value = status;
         ReleaseSRWLockShared( &lock );
         return S_OK;
     }
     HRESULT STDMETHODCALLTYPE get_ErrorCode( HRESULT *code ) override
     {
-        *code = S_OK;
+        if ( !code ) return E_POINTER;
+        AcquireSRWLockShared( &lock );
+        if ( closed ) { ReleaseSRWLockShared( &lock ); return RO_E_CLOSED; }
+        *code = error;
+        ReleaseSRWLockShared( &lock );
         return S_OK;
     }
-    HRESULT STDMETHODCALLTYPE Cancel() override { return S_OK; }
-    HRESULT STDMETHODCALLTYPE Close() override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE Cancel() override
+    {
+        ICompletedHandler_ *notify = nullptr;
+        AcquireSRWLockExclusive( &lock );
+        if ( closed ) { ReleaseSRWLockExclusive( &lock ); return RO_E_CLOSED; }
+        if ( status == STATUS_STARTED )
+        {
+            canceled = true;
+            status = STATUS_CANCELED;
+            error = E_ABORT;
+            notify = handler;
+            if ( notify ) notify->AddRef();
+        }
+        ReleaseSRWLockExclusive( &lock );
+        if ( notify ) { notify->Invoke( this, STATUS_CANCELED ); notify->Release(); }
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE Close() override
+    {
+        AcquireSRWLockExclusive( &lock );
+        if ( status == STATUS_STARTED ) { ReleaseSRWLockExclusive( &lock ); return E_ILLEGAL_METHOD_CALL_; }
+        closed = true;
+        ReleaseSRWLockExclusive( &lock );
+        return S_OK;
+    }
 };
 
 class StoreContext final : public IStoreContext_
 {
-    std::atomic<INT64> next_token{ 0 };
-
 public:
     HRESULT STDMETHODCALLTYPE QueryInterface( REFIID iid, void **out ) override
     {
+        if ( !out ) return E_POINTER;
         if ( IsEqualGUID( iid, IID_IUnknown ) || IsEqualGUID( iid, IID_IInspectable ) ||
              IsEqualGUID( iid, IID_IAgileObject_ ) || IsEqualGUID( iid, IID_IStoreContext ) )
         {
@@ -449,16 +453,18 @@ public:
 
     HRESULT STDMETHODCALLTYPE get_User( IInspectable **user ) override
     {
+        if ( !user ) return E_POINTER;
         *user = nullptr;
         return S_OK;
     }
-    /* Accepted, but no license-change source exists here, so none is ever invented. */
+    /* No change-event source exists yet. Do not invent a successful subscription. */
     HRESULT STDMETHODCALLTYPE add_OfflineLicensesChanged( IUnknown *, INT64 *token ) override
     {
-        *token = ++next_token;
-        return S_OK;
+        if ( !token ) return E_POINTER;
+        *token = 0;
+        return E_NOTIMPL;
     }
-    HRESULT STDMETHODCALLTYPE remove_OfflineLicensesChanged( INT64 ) override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE remove_OfflineLicensesChanged( INT64 ) override { return E_NOTIMPL; }
     HRESULT STDMETHODCALLTYPE GetAppLicenseAsync( IAsyncOperation_StoreAppLicense **operation ) override
     {
         if ( !operation ) return E_POINTER;
@@ -502,6 +508,7 @@ class StoreContextFactory final : public IActivationFactory_, public IStoreConte
 public:
     HRESULT STDMETHODCALLTYPE QueryInterface( REFIID iid, void **out ) override
     {
+        if ( !out ) return E_POINTER;
         if ( IsEqualGUID( iid, IID_IUnknown ) || IsEqualGUID( iid, IID_IInspectable ) ||
              IsEqualGUID( iid, IID_IAgileObject_ ) || IsEqualGUID( iid, IID_IActivationFactory_ ) )
             *out = static_cast<IActivationFactory_ *>( this );
@@ -524,17 +531,22 @@ public:
 
     HRESULT STDMETHODCALLTYPE ActivateInstance( IInspectable **instance ) override
     {
+        if ( !instance ) return E_POINTER;
         *instance = nullptr;
         return E_NOTIMPL; /* StoreContext has no public constructor */
     }
     HRESULT STDMETHODCALLTYPE GetDefault( IStoreContext_ **context ) override
     {
+        if ( !context ) return E_POINTER;
         *context = &default_context;
         return S_OK;
     }
-    HRESULT STDMETHODCALLTYPE GetForUser( IInspectable *, IStoreContext_ **context ) override
+    HRESULT STDMETHODCALLTYPE GetForUser( IInspectable *user, IStoreContext_ **context ) override
     {
-        /* Licenses come from the signed-in Store account, not a per-user context. */
+        if ( !context ) return E_POINTER;
+        *context = nullptr;
+        /* Mapping a Windows.System.User to a Store identity is unsupported. */
+        if ( user ) return E_NOTIMPL;
         *context = &default_context;
         return S_OK;
     }
@@ -551,7 +563,9 @@ extern "C" HRESULT WINAPI DllGetActivationFactory( HSTRING class_id, void **out 
 
     if ( !out ) return E_POINTER;
     *out = nullptr;
-    if ( !name || wcscmp( name, L"Windows.Services.Store.StoreContext" ) ) return CLASS_E_CLASSNOTAVAILABLE;
+    static const WCHAR supported[] = L"Windows.Services.Store.StoreContext";
+    if ( !name || length != ARRAY_SIZE( supported ) - 1 ||
+         memcmp( name, supported, length * sizeof( WCHAR ) ) ) return CLASS_E_CLASSNOTAVAILABLE;
     *out = static_cast<nexus_store_context::IActivationFactory_ *>( &nexus_store_context::factory );
     return S_OK;
 }

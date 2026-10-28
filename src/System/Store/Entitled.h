@@ -592,7 +592,7 @@ static HRESULT entitled_start( struct entitled_async *context, XAsyncBlock *asyn
 }
 
 static HRESULT entitled_begin( XStoreContextHandle store, UINT32 kinds, UINT32 page_size, XAsyncBlock *async,
-                               BOOL game = FALSE )
+                               BOOL game = FALSE, BOOL current_only = FALSE )
 {
     struct entitled_async *context;
     xmlDocPtr doc;
@@ -621,7 +621,7 @@ static HRESULT entitled_begin( XStoreContextHandle store, UINT32 kinds, UINT32 p
     xmlDocSetRootElement( doc, root );
     snprintf( kind, sizeof( kind ), "%u", kinds );
     xmlNewTextChild( root, NULL, BAD_CAST "ParentProductId", BAD_CAST GetStoreProductId() );
-    for ( i = 0; i < entitled_related_count; i++ )
+    for ( i = 0; !current_only && i < entitled_related_count; i++ )
         if ( strcmp( GetStoreProductId(), entitled_related[i] ) )
             xmlNewTextChild( root, NULL, BAD_CAST "ProductId", BAD_CAST entitled_related[i] );
     xmlNewTextChild( root, NULL, BAD_CAST "ProductKinds", BAD_CAST kind );
