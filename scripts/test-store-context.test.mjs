@@ -5,6 +5,14 @@ import fs from 'node:fs';
 import {fileURLToPath} from 'node:url';
 const root=new URL('../',import.meta.url);
 const read=name=>fs.readFileSync(new URL(name,root),'utf8');
+test('StoreContext and its standalone receipt fixture declare their own clock dependency',()=>{
+ for(const file of ['src/System/Store/StoreContext.h','tests/Nexus/store-context.cpp']){
+  const source=read(file);
+  assert.match(source,/#include <ctime>/);
+  assert.match(source,/std::time\(/);
+  assert.doesNotMatch(source,/(?<!std::)\btime\(/);
+ }
+});
 test('StoreContext uses the existing receipt transport without a stale global license cache',()=>{
  const objects=read('src/System/Store/StoreContext.h');
  const transport=read('src/System/Store/StoreContextLicense.h');
