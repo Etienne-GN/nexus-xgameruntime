@@ -2,6 +2,7 @@
 #include <gtest/gtest.h>
 #include "../../src/System/User/XUserImpl.h"
 #include "../../src/System/User/Presence.h"
+#include "../../src/System/User/OfflineIdentity.h"
 #include <wincrypt.h>
 #include <string>
 #include <vector>
@@ -43,6 +44,7 @@ class SyntheticTransport final : public UserTransport
 public:
     unsigned backendCalls = 0, httpCalls = 0, rawCalls = 0, unexpected = 0;
     unsigned defaultFailures = 0, retryMilliseconds = 0, retryCalls = 0;
+    bool unreachable = false;
     void WaitForSignInRetry( DWORD milliseconds ) noexcept override
     {
         retryMilliseconds += milliseconds;
@@ -108,6 +110,7 @@ public:
         ++httpCalls;
         *output = nullptr;
         *length = 0;
+        if ( unreachable ) return HRESULT_FROM_WIN32( ERROR_WINHTTP_CANNOT_CONNECT );
         if ( !wcscmp( url, L"https://title.mgt.xboxlive.com/titles/default/endpoints?type=1" ) )
         {
             if ( defaultFailures )
@@ -1108,4 +1111,168 @@ TEST( NexusAuthentication, SignInRetryKeepsFiveAttemptBoundAndNumericDiagnostics
             threads->XTaskQueueCloseHandle( queue );
             threads->Release();
         }
+}
+
+namespace
+{
+// A private LOCALAPPDATA and account key, and the backend's decision for this launch.
+class OfflineLaunch
+{
+public:
+    explicit OfflineLaunch( const WCHAR *mode, const WCHAR *account = L"0123456789abcdef" )
+    {
+        WCHAR base[MAX_PATH], name[MAX_PATH];
+        GetTempPathW( MAX_PATH, base );
+        GetTempFileNameW( base, L"oid", 0, name );
+        DeleteFileW( name );
+        CreateDirectoryW( name, nullptr );
+        root = name;
+        SetEnvironmentVariableW( L"LOCALAPPDATA", root.c_str() );
+        Account( account );
+        Mode( mode );
+    }
+    ~OfflineLaunch()
+    {
+        for ( auto account : { L"0123456789abcdef", L"fedcba9876543210" } )
+            nexus::user::OfflineIdentityStore( root + L"\\Xodus Nexus\\offline-identity\\" + account ).Remove();
+        RemoveDirectoryW( ( root + L"\\Xodus Nexus\\offline-identity" ).c_str() );
+        RemoveDirectoryW( ( root + L"\\Xodus Nexus" ).c_str() );
+        RemoveDirectoryW( root.c_str() );
+        for ( auto name : { L"LOCALAPPDATA", L"XODUS_ACCOUNT_HASH", L"XODUS_OFFLINE_IDENTITY", L"XODUS_FORCE_OFFLINE" } )
+            SetEnvironmentVariableW( name, nullptr );
+        nexus::user::offlineIdentityInUse = false;
+    }
+    void Mode( const WCHAR *mode )
+    {
+        SetEnvironmentVariableW( L"XODUS_OFFLINE_IDENTITY", mode );
+    }
+    void Account( const WCHAR *account )
+    {
+        SetEnvironmentVariableW( L"XODUS_ACCOUNT_HASH", account );
+    }
+    bool Cached( const WCHAR *account = L"0123456789abcdef" ) const
+    {
+        auto file = root + L"\\Xodus Nexus\\offline-identity\\" + account + L"\\identity.txt";
+        return GetFileAttributesW( file.c_str() ) != INVALID_FILE_ATTRIBUTES;
+    }
+    std::wstring root;
+};
+const HRESULT Unreachable = HRESULT_FROM_WIN32( ERROR_WINHTTP_CANNOT_CONNECT );
+}
+
+TEST( NexusOfflineIdentity, KeptOnlyWhenTheBackendReportsAFreshOfflineLease )
+{
+    Apartment apartment;
+    SyntheticTransport transport;
+    OfflineLaunch launch( L"store" );
+    {
+        auto user = CreateUser( transport );
+        ASSERT_EQ( user->InitializeNetwork( XUserAddOptions::AddDefaultUserSilently ), S_OK );
+        EXPECT_TRUE( launch.Cached() );
+    }
+    // Offline play turned off, or the designation moved to another device: the
+    // next online launch carries no offline lease and the identity goes.
+    launch.Mode( nullptr );
+    {
+        auto user = CreateUser( transport );
+        ASSERT_EQ( user->InitializeNetwork( XUserAddOptions::AddDefaultUserSilently ), S_OK );
+        EXPECT_FALSE( launch.Cached() );
+    }
+    EXPECT_EQ( transport.unexpected, 0u );
+}
+
+TEST( NexusOfflineIdentity, SignsInOnlyOnALaunchRunningOnAValidatedOfflineLicense )
+{
+    Apartment apartment;
+    SyntheticTransport transport;
+    OfflineLaunch launch( L"store" );
+    {
+        auto user = CreateUser( transport );
+        ASSERT_EQ( user->InitializeNetwork( XUserAddOptions::AddDefaultUserSilently ), S_OK );
+    }
+    ASSERT_TRUE( launch.Cached() );
+    transport.unreachable = true;
+
+    // Without the backend's verdict the cache is never read.
+    for ( auto mode : { static_cast<const WCHAR *>( nullptr ), L"store", L"1" } )
+    {
+        launch.Mode( mode );
+        auto user = CreateUser( transport );
+        EXPECT_EQ( user->InitializeNetwork( XUserAddOptions::AddDefaultUserSilently ), Unreachable );
+        EXPECT_EQ( user->SignInOffline( Unreachable ), Unreachable );
+        EXPECT_EQ( user->xuid, 0u );
+        EXPECT_FALSE( user->offline );
+    }
+    EXPECT_TRUE( launch.Cached() );
+
+    launch.Mode( L"use" );
+    auto user = CreateUser( transport );
+    // Refusals and other failures are never replaced by the cache.
+    EXPECT_EQ( user->SignInOffline( E_ACCESSDENIED ), E_ACCESSDENIED );
+    EXPECT_EQ( user->xuid, 0u );
+    ASSERT_EQ( user->SignInOffline( Unreachable ), S_OK );
+    EXPECT_TRUE( user->offline );
+    EXPECT_TRUE( nexus::user::offlineIdentityInUse );
+    EXPECT_EQ( user->xuid, 1234567890123456ull );
+    EXPECT_STREQ( user->gamertag, "Synthetic" );
+    EXPECT_EQ( user->age_group, XUserAgeGroup::Adult );
+    EXPECT_EQ( user->userToken, nullptr );
+    // No tokens exist: token requests report Microsoft as unreachable.
+    user->initDone = 1;
+    user->initResult = S_OK;
+    WCHAR *auth = nullptr;
+    EXPECT_EQ( user->GetAuthorization( L"https://service.example.invalid/", &auth ), Unreachable );
+    EXPECT_EQ( auth, nullptr );
+    EXPECT_TRUE( transport.signedBodies.empty() );
+    EXPECT_EQ( transport.unexpected, 0u );
+}
+
+TEST( NexusOfflineIdentity, AnotherAccountNeverReceivesTheCachedIdentity )
+{
+    Apartment apartment;
+    SyntheticTransport transport;
+    OfflineLaunch launch( L"store" );
+    {
+        auto user = CreateUser( transport );
+        ASSERT_EQ( user->InitializeNetwork( XUserAddOptions::AddDefaultUserSilently ), S_OK );
+    }
+    transport.unreachable = true;
+    launch.Mode( L"use" );
+    for ( auto account : { L"fedcba9876543210", L"", L"not-a-key" } )
+    {
+        launch.Account( account );
+        auto user = CreateUser( transport );
+        EXPECT_EQ( user->SignInOffline( Unreachable ), Unreachable ) << account;
+        EXPECT_EQ( user->xuid, 0u );
+    }
+}
+
+TEST( NexusOfflineIdentity, AnOfflineLaunchNeverContactsMicrosoft )
+{
+    Apartment apartment;
+    SyntheticTransport transport;
+    OfflineLaunch launch( L"use" );
+    SetEnvironmentVariableW( L"XODUS_FORCE_OFFLINE", L"1" );
+    auto user = CreateUser( transport );
+    EXPECT_EQ( user->InitializeNetwork( XUserAddOptions::AddDefaultUserSilently ), Unreachable );
+    EXPECT_EQ( transport.httpCalls, 0u );
+    EXPECT_EQ( transport.backendCalls, 0u );
+    // Nothing was ever cached for this account, so the sign-in fails closed.
+    EXPECT_EQ( user->SignInOffline( Unreachable ), Unreachable );
+}
+
+TEST( NexusOfflineIdentity, AStaleIdentityIsNotUsed )
+{
+    Apartment apartment;
+    SyntheticTransport transport;
+    OfflineLaunch launch( L"use" );
+    auto store = nexus::user::OfflineIdentityStore::ForAccount();
+    ASSERT_TRUE( store );
+    nexus::user::OfflineIdentity identity{ 1234567890123456ull, static_cast<unsigned>( XUserAgeGroup::Adult ),
+                                           nexus::user::FileTimeNow() - nexus::user::OfflineIdentityMaxAge - 1,
+                                           "Synthetic", "Synthetic", "", "Synthetic" };
+    ASSERT_TRUE( store->Save( identity, SyntheticTransport::Endpoints(), SyntheticTransport::Endpoints() ) );
+    auto user = CreateUser( transport );
+    EXPECT_EQ( user->SignInOffline( Unreachable ), Unreachable );
+    EXPECT_EQ( user->xuid, 0u );
 }
