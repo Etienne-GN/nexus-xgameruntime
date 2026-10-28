@@ -1118,7 +1118,6 @@ HRESULT XUser::SignInOffline( HRESULT failure ) noexcept
         lstrcpynA( modernGamertagSuffix, identity.modernGamertagSuffix.c_str(), sizeof( modernGamertagSuffix ) );
         lstrcpynA( uniqueModernGamertag, identity.uniqueModernGamertag.c_str(), sizeof( uniqueModernGamertag ) );
         offline = true;
-        nexus::user::offlineIdentityInUse = true;
         WARN( "Microsoft is unreachable (hr %#lx); continuing with the cached offline identity.\n", failure );
         return S_OK;
     }
@@ -1518,6 +1517,7 @@ static void set_signed_in_user( struct XUser *user )
     ( user )->AddRef();
     if ( signed_in_user ) ( signed_in_user )->Release();
     signed_in_user = user;
+    nexus::user::offlineIdentityInUse = user->offline;
     ReleaseSRWLockExclusive( &signed_in_section );
 }
 

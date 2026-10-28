@@ -1212,7 +1212,9 @@ TEST( NexusOfflineIdentity, SignsInOnlyOnALaunchRunningOnAValidatedOfflineLicens
     EXPECT_EQ( user->xuid, 0u );
     ASSERT_EQ( user->SignInOffline( Unreachable ), S_OK );
     EXPECT_TRUE( user->offline );
-    EXPECT_TRUE( nexus::user::offlineIdentityInUse );
+    // A prepared but unpublished user (including a cancelled sign-in) must
+    // not change connectivity for the current signed-in user.
+    EXPECT_FALSE( nexus::user::offlineIdentityInUse );
     EXPECT_EQ( user->xuid, 1234567890123456ull );
     EXPECT_STREQ( user->gamertag, "Synthetic" );
     EXPECT_EQ( user->age_group, XUserAgeGroup::Adult );
@@ -1245,6 +1247,43 @@ TEST( NexusOfflineIdentity, AnotherAccountNeverReceivesTheCachedIdentity )
         EXPECT_EQ( user->SignInOffline( Unreachable ), Unreachable ) << account;
         EXPECT_EQ( user->xuid, 0u );
     }
+}
+
+TEST( NexusOfflineIdentity, ConnectivityFollowsOnlyThePublishedUserAndReturnsOnline )
+{
+    Apartment apartment;
+    SyntheticTransport transport;
+    OfflineLaunch launch( L"store" );
+    {
+        auto seed = CreateUser( transport );
+        ASSERT_EQ( seed->InitializeNetwork( XUserAddOptions::AddDefaultUserSilently ), S_OK );
+    }
+    ASSERT_TRUE( launch.Cached() );
+    XUserImpl users( transport );
+    IXThreadingImpl *threading = nullptr;
+    ASSERT_EQ( QueryApiImpl( CLSID_XThreadingImpl, __uuidof( IXThreadingImpl ),
+                            reinterpret_cast<void **>( &threading ) ), S_OK );
+    XTaskQueueHandle queue = nullptr;
+    ASSERT_EQ( threading->XTaskQueueCreate( XTaskQueueDispatchMode::ThreadPool,
+                                          XTaskQueueDispatchMode::Manual, &queue ), S_OK );
+    for ( bool offline : { true, false } )
+    {
+        launch.Mode( offline ? L"use" : L"store" );
+        SetEnvironmentVariableW( L"XODUS_FORCE_OFFLINE", offline ? L"1" : nullptr );
+        XAsyncBlock async{};
+        async.queue = queue;
+        ASSERT_EQ( users.XUserAddAsync( XUserAddOptions::AddDefaultUserSilently, &async ), S_OK );
+        EXPECT_EQ( threading->XAsyncGetStatus( &async, TRUE ), S_OK );
+        XUserHandle user = nullptr;
+        ASSERT_EQ( users.XUserAddResult( &async, &user ), S_OK );
+        ASSERT_NE( user, nullptr );
+        EXPECT_EQ( user->offline, offline );
+        EXPECT_EQ( nexus::user::offlineIdentityInUse.load(), offline );
+        users.XUserCloseHandle( user );
+        EXPECT_EQ( WaitForUserSignInWorkers( 5000 ), S_OK );
+    }
+    threading->XTaskQueueCloseHandle( queue );
+    threading->Release();
 }
 
 TEST( NexusOfflineIdentity, AnOfflineLaunchNeverContactsMicrosoft )
