@@ -4,6 +4,7 @@
 #include "../../src/private.h"
 #include <xstore.h>
 #include <cstdio>
+#include <ctime>
 #include <atomic>
 #include "../../src/System/Store/StoreContext.h"
 static std::atomic<int> queries{0};
@@ -84,13 +85,13 @@ int main()
     CHECK(empty.get_ExpirationDate(nullptr)==E_POINTER);
     CHECK(empty.get_SkuStoreId(nullptr)==E_POINTER);
     CHECK(empty.GetRuntimeClassName(nullptr)==E_POINTER);
-    receipt.isActive=true;receipt.expirationDate=time(nullptr)+60;
+    receipt.isActive=true;receipt.expirationDate=std::time(nullptr)+60;
     CHECK(activeOperation());
     verdict=E_ACCESSDENIED;
     CHECK(!activeOperation()); // No fallback to previous successful receipt.
     verdict=S_OK;receipt.isActive=false;
     CHECK(!activeOperation()); // Different account, no rights.
-    receipt.isActive=true;receipt.expirationDate=time(nullptr)-1;
+    receipt.isActive=true;receipt.expirationDate=std::time(nullptr)-1;
     CHECK(!activeOperation());
     CHECK(queries==4);
     auto *op=new AppLicenseOperation;

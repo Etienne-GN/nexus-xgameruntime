@@ -10,6 +10,7 @@
 #include <inspectable.h>
 #include <winstring.h>
 #include <atomic>
+#include <ctime>
 #include <new>
 
 namespace nexus_store_context
@@ -180,7 +181,7 @@ public:
     HRESULT STDMETHODCALLTYPE get_IsActive( boolean *value ) override
     {
         if ( !value ) return E_POINTER;
-        *value = license.isActive && license.expirationDate > time( nullptr ) ? TRUE : FALSE;
+        *value = license.isActive && license.expirationDate > std::time( nullptr ) ? TRUE : FALSE;
         return S_OK;
     }
     HRESULT STDMETHODCALLTYPE get_IsTrial( boolean *value ) override
