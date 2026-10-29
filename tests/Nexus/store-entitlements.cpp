@@ -865,6 +865,15 @@ static DWORD WINAPI wait_test_unregister( void *arg )
     return 0;
 }
 
+static BOOL durable_unlicensed( struct entitled_snapshot *proof, const char *store, IXThreadingImpl *threads )
+{
+    struct package_license *license = NULL;
+    BOOL unlicensed = durable_license_from_snapshot( proof, store, threads, &license ) == S_OK && license &&
+                      !package_license_valid_object( license );
+    if ( license ) package_license_dispose( license );
+    return unlicensed;
+}
+
 static void test_package_licenses( void )
 {
     IXThreadingImpl *threads = NULL;
@@ -928,30 +937,23 @@ static void test_package_licenses( void )
            durable_license_from_snapshot( &proof, product.storeId, threads, &license ) == E_ACCESSDENIED && !license );
     proof.proof_until = time( NULL ) + 60;
     sku.isTrial = TRUE;
-    CHECK( "durable-trial-no-grant",
-           durable_license_from_snapshot( &proof, product.storeId, threads, &license ) == E_ACCESSDENIED && !license );
+    CHECK( "durable-trial-no-grant", durable_unlicensed( &proof, product.storeId, threads ) );
     sku.isTrial = FALSE;
     sku.isInUserCollection = FALSE;
-    CHECK( "durable-unowned-sku-no-grant",
-           durable_license_from_snapshot( &proof, product.storeId, threads, &license ) == E_ACCESSDENIED && !license );
+    CHECK( "durable-unowned-sku-no-grant", durable_unlicensed( &proof, product.storeId, threads ) );
     sku.isInUserCollection = TRUE;
     product.isInUserCollection = FALSE;
-    CHECK( "durable-unowned-product-no-grant",
-           durable_license_from_snapshot( &proof, product.storeId, threads, &license ) == E_ACCESSDENIED && !license );
+    CHECK( "durable-unowned-product-no-grant", durable_unlicensed( &proof, product.storeId, threads ) );
     product.isInUserCollection = TRUE;
-    CHECK( "durable-wrong-product-no-grant",
-           durable_license_from_snapshot( &proof, "B00000000002", threads, &license ) == E_ACCESSDENIED && !license );
+    CHECK( "durable-wrong-product-no-grant", durable_unlicensed( &proof, "B00000000002", threads ) );
     sku.collectionData.endDate = -1;
-    CHECK( "durable-negative-expiry-no-grant",
-           durable_license_from_snapshot( &proof, product.storeId, threads, &license ) == E_ACCESSDENIED && !license );
+    CHECK( "durable-negative-expiry-no-grant", durable_unlicensed( &proof, product.storeId, threads ) );
     sku.collectionData.endDate = time( NULL ) - 1;
-    CHECK( "durable-expired-sku-no-grant",
-           durable_license_from_snapshot( &proof, product.storeId, threads, &license ) == E_ACCESSDENIED && !license );
+    CHECK( "durable-expired-sku-no-grant", durable_unlicensed( &proof, product.storeId, threads ) );
     sku.collectionData.endDate = time( NULL ) + 3600;
     product.hasDigitalDownload = TRUE;
     product.productKind = XStoreProductKind::Game;
-    CHECK( "durable-base-no-grant",
-           durable_license_from_snapshot( &proof, product.storeId, threads, &license ) == E_ACCESSDENIED && !license );
+    CHECK( "durable-base-no-grant", durable_unlicensed( &proof, product.storeId, threads ) );
     CHECK( "license-base-not-durable",
            package_license_from_snapshot( &proof, product.storeId, threads, &license ) == E_ACCESSDENIED );
     product.productKind = XStoreProductKind::Durable;
@@ -1156,6 +1158,16 @@ static void test_durable_acquisition( void )
     context.store_context = store;
     CHECK( "durable-store-identity", entitled_store_identity( store, &xuid, &context.store_serial ) == S_OK );
     CHECK( "durable-store-live", durable_license_context_valid( &context ) );
+    CHECK( "durable-unlicensed-fixture", package_license_create_unlicensed( threads, &context.license ) == S_OK );
+    {
+        XAsyncProviderData data = {};
+        data.context = &context;
+        data.buffer = &result;
+        data.bufferSize = sizeof( result );
+        CHECK( "durable-unlicensed-result", package_license_provider( XAsyncOp::GetResult, &data ) == S_OK &&
+                                                result && !context.license && !package_license_valid( result ) );
+        package_license_close( result );
+    }
     context.store_serial++;
     CHECK( "durable-wrong-generation", !durable_license_context_valid( &context ) );
     context.store_serial--;

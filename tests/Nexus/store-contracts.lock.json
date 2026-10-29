@@ -368,6 +368,8 @@
       "catalog-work",
       "catalog-failure-propagated",
       "catalog-failure-no-query-handle",
+      "durable-unlicensed-fixture",
+      "durable-unlicensed-result",
       "current-game-real-sku-and-proof-expiry",
       "current-game-no-fabricated-trial-or-disc",
       "current-game-no-proof-no-license",
